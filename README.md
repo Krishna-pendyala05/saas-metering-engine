@@ -34,7 +34,7 @@ We provide a **Modular Monolith** backend that acts as a "Metering Engine".
 
 The system follows a clean **"Modular Monolith"** architecture, separating concerns into distinct layers:
 
-![Architecture Diagram](architecture.png)
+<img src="architecture.png" width="100%" alt="Architecture Diagram">
 
 ### Key Components:
 
