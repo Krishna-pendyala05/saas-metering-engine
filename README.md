@@ -1,126 +1,206 @@
 # Multi-Tenant SaaS Subscription & Usage Metering Platform
 
-A high-performance, concurrency-safe API backend designed to solve the critical "Metered Billing" problem for SaaS companies.
+A **concurrency-safe API backend** for usage-based billing — a pattern common to modern API-driven SaaS products where requests must be counted atomically across concurrent users.
 
 ---
 
 ## 1. The Problem
 
-In the modern API economy (e.g., OpenAI, Twilio, Stripe), pricing is rarely flat. It is **usage-based** (pay-per-call, pay-per-minute).
-Building a system that counts requests accurately at scale is difficult:
+In the API economy, pricing is usage-based (pay-per-call, pay-per-minute). Building a system that counts requests accurately under load is non-trivial:
 
-- **Race Conditions:** If two users hit the API at the exact same microsecond, a naive counter will only count 1 instead of 2. This leads to **revenue leakage**.
-- **Latency:** Checking limits on every request can slow down the API.
-- **Complexity:** Managing Multi-Tenancy (Organizations vs Users) and reset logic (Monthly vs Daily) is non-trivial.
-
-## 2. Stakeholders
-
-- **SaaS Founders:** Need a way to monetize their API products immediately.
-- **API Developers:** Need a drop-in middleware that handles "Rate Limiting" and "Metering" so they can focus on business logic.
-- **Product Managers:** Need visibility into who is using the platform and how much.
-
-## 3. Our Solution
-
-We provide a **Modular Monolith** backend that acts as a "Metering Engine".
-
-- **Atomic Accounting:** Uses database-level locking and atomic increments (`UPDATE ... SET count = count + 1`) to guarantee 100% accuracy, even under high concurrency.
-- **Zero-Latency Overhead:** Optimized SQL queries ensure limit checks happen in milliseconds.
-- **Tenant Isolation:** Built-in concept of "Organizations", allowing teams to share a quota.
-- **Dynamic Enforcement:** Validates limits in real-time. If a user exceeds their plan, they are instantly blocked with a `429 Too Many Requests`.
+- **Race Conditions:** Two requests arriving simultaneously on a naive counter read the same value and both write `count + 1`, counting only once instead of twice. This causes **undercounting**, which breaks billing accuracy.
+- **Latency:** Checking a database on every request introduces lock contention, connection pool pressure, and write amplification — all of which compound under concurrent load.
+- **Multi-Tenancy:** Enforcing per-organization quota windows while maintaining strict isolation between tenants is non-trivial, especially across concurrent sessions.
 
 ---
 
-## 4. Architecture
+## 2. My Solution
 
-The system follows a clean **"Modular Monolith"** architecture, separating concerns into distinct layers:
+I built a **Modular Monolith** backend that handles usage tracking and quota enforcement:
+
+- **Atomic Accounting:** Database-level atomic increments (`UPDATE ... SET count = count + 1 WHERE count < limit`) prevent lost increments under concurrent load, verified by concurrency tests.
+- **Tenant Isolation:** Built-in concept of "Organizations" — all users under one org share a quota.
+- **Dynamic Enforcement:** Limits are validated in real-time. Exceeding the quota immediately returns `429 Too Many Requests` with a countdown timer.
+- **Self-Healing Windows:** Usage is stored in time buckets, not reset by a cron job. The system recovers automatically after downtime.
+
+---
+
+## 3. Architecture
+
+The system follows a clean layered architecture separating routing, business logic, and data:
 
 <img src="architecture.png" width="100%" alt="Architecture Diagram">
 
-### Key Components:
+### Key Components
 
-1.  **`api/deps.py`**: The "Gatekeeper". Every request goes through `check_usage_limits`.
-2.  **`core/metering.py`**: The "Accountant". Handles the atomic math and window calculations (currently 5-minute rolling windows).
-3.  **`models/`**: The "Truth". SQLAlchemy models defining the relationship between Users, Organizations, Plans, and Usage.
-
----
-
-## 5. Technology Stack & Motivation
-
-| Technology       | Role             | Why we chose it?                                                                                                                             |
-| :--------------- | :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
-| **FastAPI**      | Web Framework    | **Performance.** It is one of the fastest Python frameworks available (AsyncIO based) and provides automatic Swagger documentation.          |
-| **PostgreSQL**   | Database         | **Reliability & ACID Compliance.** For billing data, we cannot afford "eventual consistency" (NoSQL). We need strict transaction guarantees. |
-| **SQLAlchemy**   | ORM              | **Type Safety.** Provides a robust way to model complex relationships (1-to-many) without writing raw SQL for everything.                    |
-| **Docker**       | Containerization | **Portability.** Ensures the app "just works" on any machine, eliminating "it works on my machine" bugs.                                     |
-| **Argon2 / JWT** | Security         | **Industry Standard.** Best-in-class password hashing and stateless authentication.                                                          |
+| Component      | File                   | Responsibility                               |
+| -------------- | ---------------------- | -------------------------------------------- |
+| **Gatekeeper** | `api/deps.py`          | Intercepts every request, enforces quotas    |
+| **Accountant** | `core/metering.py`     | Atomic math, window calculations, 429 errors |
+| **Models**     | `models/all_models.py` | SQLAlchemy: Users, Orgs, Plans, UsageRecords |
+| **Config**     | `core/config.py`       | All settings from env vars; DEMO_MODE toggle |
 
 ---
 
-## 6. How to Use
+## 4. Project Structure
+
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   │   ├── deps.py         # Dependency: rate limit enforcement
+│   │   │   ├── health.py       # Health check endpoint
+│   │   │   └── api_v1/
+│   │   │       └── endpoints/  # login, users, widgets
+│   │   ├── core/
+│   │   │   ├── config.py       # Settings (env vars, DEMO_MODE)
+│   │   │   ├── metering.py     # ← Core business logic
+│   │   │   ├── security.py     # JWT + Argon2
+│   │   │   └── logging.py      # Structured JSON logging
+│   │   ├── models/
+│   │   │   └── all_models.py   # SQLAlchemy ORM models
+│   │   ├── schemas/            # Pydantic request/response models
+│   │   └── main.py             # App entry point, middleware
+│   ├── tests/
+│   │   ├── core/
+│   │   │   └── test_metering.py  # Unit tests (mocked DB)
+│   │   └── api/
+│   │       └── test_integration.py # Integration tests (full flow)
+│   └── alembic/                # DB migrations
+├── scripts/
+│   └── benchmark.py            # Concurrency benchmark script
+├── Dockerfile                  # Multi-stage build, non-root user
+├── docker-compose.yml
+├── BENCHMARKS.md
+└── IMPLEMENTATION_JOURNEY.md
+```
+
+---
+
+## 5. Quick Start
 
 ### Prerequisites
 
-- Docker & Docker Compose installed.
+- Docker & Docker Compose
 
-### Setup & Run
+### Run
 
-1.  **Clone the repository.**
-2.  **Start the System:**
-    ```bash
-    docker-compose up -d --build
-    ```
-3.  **Access the API:**
-    Open your browser to: **[http://localhost:8000/docs](http://localhost:8000/docs)**
+```bash
+# 1. Clone the repo
+git clone https://github.com/Krishna-pendyala05/saas-metering-engine.git
+cd saas-metering-engine
 
-### Testing the Metering (Walkthrough)
+# 2. Start everything (DB + API)
+docker-compose up -d --build
 
-1.  **Sign Up:** Use `POST /api/v1/users/` to create an admin account.
-2.  **Authorize:** Click "Authorize" at the top right of Swagger UI and log in.
-3.  **Check Profile:** Call `GET /api/v1/users/me` to see your **Organization ID** and Plan.
-4.  **Use the Service:** Call `GET /api/v1/widgets/`.
-    - **Header Check:** Look at `X-RateLimit-Remaining` in the response headers.
-    - **Hit the Limit:** Keep calling it until you exceed the quota (default: 5 requests / 5 mins).
-    - **Observe Block:** You will receive a `429 Too Many Requests` error with a countdown timer.
+# 3. Open the interactive API docs
+open http://localhost:8000/docs
+```
+
+### Try the Metering (Walkthrough)
+
+1. **Sign Up** → `POST /api/v1/users/`
+2. **Login** → Click "Authorize" in Swagger UI
+3. **Check Profile** → `GET /api/v1/users/me` (shows your Organization and Plan)
+4. **Hit the Metered Endpoint** → `GET /api/v1/widgets/`
+   - Watch `X-RateLimit-Remaining` decrease in the response headers
+   - After 5 requests (demo default), receive `429 Too Many Requests`
 
 ---
 
-## 7. Common Errors & Troubleshooting
+## 6. Running Tests
+
+```bash
+# Unit + integration tests inside Docker (recommended)
+docker exec saas-subscriptionusagemetering-backend-1 \
+  python -m pytest /app/backend/tests/ -v
+
+# Or locally
+cd backend && pytest
+```
+
+---
+
+## 7. Technology Stack
+
+| Technology             | Role             | Rationale                                                  |
+| :--------------------- | :--------------- | :--------------------------------------------------------- |
+| **FastAPI**            | Web Framework    | Async, auto-generated Swagger docs, high performance       |
+| **PostgreSQL**         | Database         | ACID compliance — billing data requires strict consistency |
+| **SQLAlchemy (async)** | ORM              | Type-safe models, async query support via asyncpg          |
+| **Argon2 / JWT**       | Auth             | Industry-standard password hashing + stateless tokens      |
+| **Docker**             | Containerization | Multi-stage build, non-root user, reproducible environment |
+| **structlog**          | Logging          | Structured JSON logs for production observability          |
+
+---
+
+## 8. Key Engineering Decisions
+
+| Decision        | Choice                                         | Full rationale                                                                                |
+| --------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Counter storage | PostgreSQL atomic `UPDATE`                     | See [Implementation Journey](IMPLEMENTATION_JOURNEY.md#1-the-concurrency-problem--decision)   |
+| Reset logic     | Rolling time-bucket rows (no cron job)         | See [Implementation Journey](IMPLEMENTATION_JOURNEY.md#challenge-a-the-reset-logic-fragility) |
+| Security        | Env vars, multi-stage Docker, Argon2, Pydantic | See [Implementation Journey](IMPLEMENTATION_JOURNEY.md#3-notable-design-choices)              |
+
+For the full reasoning behind every trade-off, see **[IMPLEMENTATION_JOURNEY.md](IMPLEMENTATION_JOURNEY.md)**.
+
+---
+
+## 9. Performance Benchmarks
+
+Tested with 50 simultaneous concurrent users firing 500 total requests:
+
+| Metric              | Result                                                             |
+| ------------------- | ------------------------------------------------------------------ |
+| **Throughput**      | ~82–90 req/s (local Docker on Windows)                             |
+| **Latency (P95)**   | ~1400ms (Docker-on-Windows overhead; expect 5–10× better on Linux) |
+| **Error Rate**      | **0% — zero errors across 500 concurrent requests**                |
+| **Race Conditions** | **0 detected**                                                     |
+
+> For a metering engine, **correctness under concurrency is the critical metric**, not raw throughput. Zero over-limit requests and zero double-counts are the guarantee this system provides.
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the full methodology.
+
+```bash
+python scripts/benchmark.py
+```
+
+---
+
+## 10. Operating Modes
+
+| Mode           | Window                            | Config            | Purpose                                             |
+| -------------- | --------------------------------- | ----------------- | --------------------------------------------------- |
+| **Demo**       | 5-minute rolling reset            | `DEMO_MODE=true`  | Lets reviewers observe the rate-limit reset quickly |
+| **Production** | Monthly reset (1st of month, UTC) | `DEMO_MODE=false` | Real SaaS billing behavior                          |
+
+---
+
+## 11. Troubleshooting
 
 ### `Error: port is already allocated`
 
-- **Cause:** You likely have another PostgreSQL running on port `5432` or the app is already running.
-- **Fix:**
-  - Stop other services: `docker-compose down`
-  - Or change ports in `docker-compose.yml` (e.g., `5435:5432`). _Note: Our config defaults to 5435 for DB to avoid conflicts._
+Stop existing containers: `docker-compose down`. The DB is exposed on port `5435` (not `5432`) to avoid local conflicts.
 
-### `alembic: command not found` (inside container)
+### `alembic: command not found`
 
-- **Cause:** Dependency installation issues.
-- **Fix:** Ensure `poetry` or `pip` installed `alembic`. Run `docker-compose build` again.
+Run `docker-compose build` to rebuild the image with all dependencies.
 
-### `Authentication Failed` (401)
+### `401 Unauthorized`
 
-- **Cause:** You forgot to put the token in the header.
-- **Fix:** Use the "Authorize" button in Swagger UI. It handles the `Authorization: Bearer <token>` header automatically.
+Use the "Authorize" button in Swagger UI to set the `Bearer <token>` header automatically.
 
 ---
 
----
+## 12. Extension Points
 
-## 8. Implementation Journey
-
-For a detailed breakdown of the engineering challenges, architectural decisions (e.g., why Postgres over Redis), and adaptations made during development, please see the **[Implementation Journey & Design Decisions](IMPLEMENTATION_JOURNEY.md)** document.
-
----
-
-## 9. For Enterprise Integration (Customization)
-
-This project is built as a **White-Label Engine**.
-
-- **Integration:** You can import this logic into your existing Django/Flask/Node app by connecting to the same PostgreSQL database and using the same queries.
-- **Payment Gateways:** To go "Live", simply add a webhook handler for Stripe/Paddle. When a payment succeeds, update the `subscription_plans` table or move the user's `organization.plan_id` to the "Pro" plan.
-- **Scaling:** For millions of requests, this architecture can be upgraded to use **Redis** for the counters (faster, but slightly less durable) using the exact same logic structure.
+- **Stripe Integration:** Add a webhook handler — on payment success, update `organization.plan_id` to a higher tier plan.
+- **Tiered Endpoints:** Assign different "credit costs" per endpoint (heavy = 5 credits, light = 1 credit) by wrapping `check_usage_limits`.
+- **Redis at Scale:** For millions of RPM, replace the PostgreSQL counter with a Redis `INCR` and async-sync to Postgres for permanent records — the interface stays identical.
 
 ---
 
-**Developed and Maintained by:** Murali Krishna Pendyala
+**Built by Murali Krishna Pendyala**
+
+[BENCHMARKS.md](BENCHMARKS.md) · [Implementation Journey](IMPLEMENTATION_JOURNEY.md)

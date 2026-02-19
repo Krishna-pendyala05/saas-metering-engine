@@ -16,4 +16,5 @@ trio>=0.24.0
 argon2-cffi>=23.1.0
 python-multipart>=0.0.9
 email-validator>=2.1.0
+structlog>=24.1.0
 

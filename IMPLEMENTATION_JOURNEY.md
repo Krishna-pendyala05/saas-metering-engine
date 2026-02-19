@@ -1,16 +1,14 @@
 # Implementation Journey & Engineering Decisions
 
-This document chronicles the development process of the **SaaS Metering Platform**, highlighting the technical challenges faced, the trade-offs considered, and the architectural decisions made. It is intended for technical reviewers and recruiters interested in the "why" behind the code.
+This document is the authoritative record of the technical challenges faced, trade-offs evaluated, and architectural decisions made during development. It is intended for technical reviewers who want to understand the **why** behind the code, not just what it does.
 
 ---
 
-## 1. Research & The Concurrency Problem
-
-The core challenge of any metering system is **accuracy under load**.
+## 1. The Concurrency Problem & Decision
 
 ### The "Race Condition" Trap
 
-A naive implementation might look like this:
+A naive implementation of a request counter looks like this:
 
 ```python
 # BAD: Classic Read-Modify-Write Race Condition
@@ -19,26 +17,37 @@ if current_usage < limit:
     set_usage(org_id, current_usage + 1)
 ```
 
-If two requests arrive simultaneously, they both read the same `current_usage` (e.g., 99), and both write `100`. The actual usage should be `101`. In a high-volume API, this leads to significant **revenue leakage**.
+If two requests arrive simultaneously, they both read the same `current_usage` (e.g., 99), and both write `100`. The actual usage should be `101`. In a metering context, this is silent billing failure — the system under-charges without any error or log.
 
-### The Decision: PostgreSQL Atomic Updates
+### Evaluated Options
 
-I evaluated two solutions:
+| Option                         | Pros                                                   | Cons                                                                      |
+| ------------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| **Redis `INCR`**               | Fastest possible counter                               | Persistence trade-offs (AOF vs. RDB), sync lag risk, extra infrastructure |
+| **PostgreSQL atomic `UPDATE`** | ACID compliant, single source of truth, no extra infra | Higher per-request latency than in-memory                                 |
 
-1.  **Redis (INCR):** Extremely fast, but simple key-value storage. Persistence can be tricky (AOF vs RDB trade-offs).
-2.  **PostgreSQL (UPDATE ... RETURNING):** ACID compliant, guaranteeing data integrity.
+### Decision: PostgreSQL Atomic Update
 
-**Verdict:** I chose **PostgreSQL**.
+```sql
+UPDATE usage_records
+SET request_count = request_count + 1
+WHERE organization_id = :org_id
+  AND period_start   = :period_start
+  AND request_count  < :limit
+RETURNING request_count;
+```
 
-- **Why?** Billing data requires strict consistency over raw speed.
-- **Implementation:** I used an atomic query:
-  ```sql
-  UPDATE usage_records
-  SET request_count = request_count + 1
-  WHERE organization_id = :org_id AND request_count < :limit
-  RETURNING request_count
-  ```
-  This pushes the locking logic to the database engine, ensuring 100% accuracy without complex application-level locking.
+The database engine serializes concurrent writes at the row level. If the row doesn't update (returns `NULL`), the limit has been hit. No application-level locking is needed. The constraint is pushed down to where it can be enforced atomically.
+
+Additionally, to safely initialize a new period record without a race condition on insert, I use:
+
+```sql
+INSERT INTO usage_records (organization_id, period_start, request_count)
+VALUES (:org_id, :period_start, 0)
+ON CONFLICT (organization_id, period_start) DO NOTHING;
+```
+
+This guarantees only one row per (org, period) window regardless of concurrency.
 
 ---
 
@@ -47,21 +56,29 @@ I evaluated two solutions:
 ### Challenge A: The "Reset Logic" Fragility
 
 - **Initial Thought:** Use a cron job (Celery/APScheduler) to reset counters at midnight.
-- **The Flaw:** If the cron job fails or the server is down at 00:00, usage never resets. Users remain blocked indefinitely.
-- **The Adaptation:** **"Lazy Rolling Windows"**.
-  - Instead of resetting a row, we conceptualize usage as time buckets (e.g., `2023-10-27 10:00:00`).
-  - When a request comes in, we calculate the _current_ bucket.
-  - If a record for that bucket exists, we increment it.
-  - If not, we create it.
-  - **Benefit:** The system is self-healing. No background workers are required. If the system is down for an hour, it simply starts a fresh bucket when it comes back up.
+- **The Flaw:** If the cron job fails or the server is down at reset time, users remain blocked indefinitely, or worse — their quota never resets. This is a silent operational failure.
+- **The Adaptation: "Self-Healing Rolling Windows"**
+  - Instead of mutating existing rows, usage is stored as **time-bucket rows** (e.g., `period_start = 2024-10-01 00:00:00`).
+  - On every request, the current bucket is calculated from `datetime.now()`.
+  - If a record for that bucket exists, it is incremented. If not, a new one is created atomically.
+  - **Benefit:** No background workers required. After any downtime, the system starts a fresh bucket and operates correctly without intervention.
 
-### Challenge B: Improving Developer Experience (DX)
+### Challenge B: Developer Experience for Rate-Limited APIs
 
-- **Observation:** A simple `429 Too Many Requests` status code often frustrates users because they don't know _when_ to retry.
-- **Solution:** I enhanced the `Dependency` to inject standardization headers:
-  - `X-RateLimit-Limit`: Total allowed.
-  - `X-RateLimit-Remaining`: How many left.
-  - **Smart Error Messages:** Calculated the exact seconds remaining in the current window (`timedelta`) and returned a helpful message: _"Rate limit exceeded. Try again in 43 seconds."_
+- **Observation:** A bare `429 Too Many Requests` frustrates API consumers who don't know when to retry.
+- **Solution:** I inject standard rate-limit headers on every response:
+  - `X-RateLimit-Limit` — total quota for the period
+  - `X-RateLimit-Used` — requests consumed so far
+  - `X-RateLimit-Remaining` — remaining requests
+  - The `429` response body also includes a precise countdown: _"Rate limit exceeded. Try again in 43 seconds."_, calculated from the start of the next window.
+
+### Challenge C: Testing Time-Dependent Logic
+
+- **Problem:** Testing monthly billing resets is impossible without waiting 30 days.
+- **Solution:** I parameterized the window logic via a `DEMO_MODE` environment variable.
+  - `DEMO_MODE=true` → 5-minute rolling windows (fast enough to observe and test)
+  - `DEMO_MODE=false` → Monthly windows (production billing behaviour)
+- This allows full end-to-end verification of the reset logic in real-time without mocking `datetime.now()`.
 
 ---
 
@@ -69,22 +86,35 @@ I evaluated two solutions:
 
 ### Modular Monolith Architecture
 
-- I avoided Microservices to keep the operational complexity low.
-- However, I structured the code (`core`, `api`, `models`, `schemas`) so that the "Metering Engine" is decoupled from the "User Management" logic. This allows for easy extraction into a microservice in the future if scaling requires it.
+I chose a **Modular Monolith** over Microservices deliberately:
 
-### Testing Time-Dependent Logic
+- Microservices add network latency, distributed transaction complexity, and operational overhead that isn't justified at this scale.
+- However, the code is structured so the metering engine (`core/metering.py`) is fully decoupled from user management (`api/`). No shared state, no circular imports. It can be extracted into a standalone service later without architecture changes.
 
-- Testing "Monthly" resets is hard. Waiting 30 days for a test to pass is impossible.
-- **Solution:** I parameterized the metering window logic. During development/testing, I switched the logic to use **5-minute windows**. This allowed me to verify the "Reset" behavior manually and via integration tests in real-time.
+### Security Layers
+
+| Layer     | Implementation                                | Reason                                                                |
+| --------- | --------------------------------------------- | --------------------------------------------------------------------- |
+| Secrets   | All via environment variables, no defaults    | Prevents credential leaks in source control                           |
+| Container | Multi-stage Dockerfile, non-root user         | Reduces attack surface and image size                                 |
+| Passwords | Argon2 hashing                                | Best-in-class; resistant to GPU cracking                              |
+| Auth      | JWT with configurable expiry                  | Stateless; no server-side session storage needed                      |
+| CORS      | Configurable `BACKEND_CORS_ORIGINS` allowlist | Prevents cross-origin abuse                                           |
+| Schema    | Strict Pydantic models on all I/O             | Validation at the boundary; prevents garbage data entering the system |
+
+### Async Throughout
+
+The entire stack uses Python's `asyncio` — FastAPI, SQLAlchemy (with `asyncpg`), and `httpx` in tests. This means a single worker process can handle many concurrent requests without thread switching overhead, which is critical for a high-concurrency metering service.
 
 ---
 
 ## 4. Future Roadmap
 
-If this were to go into high-scale production (millions of RPM), I would:
+If this were to scale to millions of requests per minute:
 
-1.  **Redis Caching Layer:** Use Lua scripts in Redis for the counters to reduce DB load, and asynchronously sync to Postgres for permanent billing records.
-2.  **Tiered limits:** Allow different rate limits for different endpoints (e.g., "heavy" endpoints cost 5 credits, "light" endpoints cost 1).
+1. **Redis caching layer:** Use Redis `INCR` for the hot counter with Lua scripts for atomicity, and async-flush to PostgreSQL for permanent billing records. Keeps the interface identical.
+2. **Tiered credit costs:** Allow different endpoints to consume different quota amounts (e.g., a compute-heavy endpoint costs 5 credits, a lookup costs 1).
+3. **Webhook integration:** Add a Stripe/Paddle webhook handler — on payment success, update `organization.plan_id` to a higher tier. The metering engine picks up the new limit on the next request automatically.
 
 ---
 

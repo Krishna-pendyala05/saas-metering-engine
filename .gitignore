@@ -1,0 +1,48 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Testing & Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.xml
+
+# ── Environment & Secrets ─────────────────────────────────────────────────────
+# NEVER commit secrets to source control
+.env
+.env.*
+!.env.example
+
+# ── Debug / Scratch output ────────────────────────────────────────────────────
+test_output*.txt
+
+# ── Personal / Planning docs (not part of the public repo) ───────────────────
+RESUME_BULLETS.md
+*.pdf
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.DS_Store
+Thumbs.db
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# Keep Dockerfile and docker-compose.yml tracked — exclude runtime volumes
+postgres_data/
+
+# ── Alembic ───────────────────────────────────────────────────────────────────
+# Keep migrations tracked; exclude only local overrides
+alembic.ini.local
