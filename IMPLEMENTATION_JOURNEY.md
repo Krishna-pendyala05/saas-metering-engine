@@ -77,8 +77,9 @@ This guarantees only one row per (org, period) window regardless of concurrency.
 - **Problem:** Testing monthly billing resets is impossible without waiting 30 days.
 - **Solution:** I parameterized the window logic via a `DEMO_MODE` environment variable.
   - `DEMO_MODE=true` → 5-minute rolling windows (fast enough to observe and test)
-  - `DEMO_MODE=false` → Monthly windows (production billing behaviour)
-- This allows full end-to-end verification of the reset logic in real-time without mocking `datetime.now()`.
+  - `DEMO_MODE=false` → Monthly windows (production billing behavior)
+- **Alternative Considered:** Mocking time with `freezegun`.
+- **Decision:** I chose explicit `DEMO_MODE` because it tests the _actual_ database query logic for window calculation, which `freezegun` might mask (since `CURRENT_TIMESTAMP` in SQL is independent of Python time).
 
 ---
 
@@ -102,6 +103,13 @@ I chose a **Modular Monolith** over Microservices deliberately:
 | CORS      | Configurable `BACKEND_CORS_ORIGINS` allowlist | Prevents cross-origin abuse                                           |
 | Schema    | Strict Pydantic models on all I/O             | Validation at the boundary; prevents garbage data entering the system |
 
+### Observability & Logging
+
+I replaced standard print debugging with **structured JSON logging** (`structlog`).
+
+- **Why?** In production, logs are ingested by tools like Datadog/ELK. JSON logs are machine-parsable, allowing valid queries like `env:prod status:500`.
+- **Context:** Every log entry automatically carries the `request_id`, `user_id`, and `latency`, making distributed tracing possible.
+
 ### Async Throughout
 
 The entire stack uses Python's `asyncio` — FastAPI, SQLAlchemy (with `asyncpg`), and `httpx` in tests. This means a single worker process can handle many concurrent requests without thread switching overhead, which is critical for a high-concurrency metering service.
@@ -112,7 +120,12 @@ The entire stack uses Python's `asyncio` — FastAPI, SQLAlchemy (with `asyncpg`
 
 If this were to scale to millions of requests per minute:
 
-1. **Redis caching layer:** Use Redis `INCR` for the hot counter with Lua scripts for atomicity, and async-flush to PostgreSQL for permanent billing records. Keeps the interface identical.
+1. **High-Scale Caching (Write-Behind Pattern):**
+   - **Problem:** Database `UPDATE` locks rows, creating a bottleneck at >10k RPM per tenant.
+   - **Solution:** Move the hot counter to Redis using `INCR` (atomic).
+   - **Reliability:** Use a **Lua script** to check quota and increment in one atomic step.
+   - **Durability:** Async worker flushes the final count to PostgreSQL every 10s (Write-Behind).
+   - **Trade-off:** Small window of potential data loss on Redis crash vs. massive throughput gain.
 2. **Tiered credit costs:** Allow different endpoints to consume different quota amounts (e.g., a compute-heavy endpoint costs 5 credits, a lookup costs 1).
 3. **Webhook integration:** Add a Stripe/Paddle webhook handler — on payment success, update `organization.plan_id` to a higher tier. The metering engine picks up the new limit on the next request automatically.
 

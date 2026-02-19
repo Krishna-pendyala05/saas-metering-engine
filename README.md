@@ -151,12 +151,12 @@ For the full reasoning behind every trade-off, see **[IMPLEMENTATION_JOURNEY.md]
 
 Tested with 50 simultaneous concurrent users firing 500 total requests:
 
-| Metric              | Result                                                             |
-| ------------------- | ------------------------------------------------------------------ |
-| **Throughput**      | ~82–90 req/s (local Docker on Windows)                             |
-| **Latency (P95)**   | ~1400ms (Docker-on-Windows overhead; expect 5–10× better on Linux) |
-| **Error Rate**      | **0% — zero errors across 500 concurrent requests**                |
-| **Race Conditions** | **0 detected**                                                     |
+| Metric              | Result                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| **Throughput**      | ~82–90 req/s (local Docker on Windows)                                                      |
+| **Latency (P95)**   | ~1400ms (Local Docker for Windows filesystem overhead; expected <100ms on Linux/Production) |
+| **Error Rate**      | **0% — zero errors across 500 concurrent requests**                                         |
+| **Race Conditions** | **0 detected**                                                                              |
 
 > For a metering engine, **correctness under concurrency is the critical metric**, not raw throughput. Zero over-limit requests and zero double-counts are the guarantee this system provides.
 
@@ -197,7 +197,7 @@ Use the "Authorize" button in Swagger UI to set the `Bearer <token>` header auto
 
 - **Stripe Integration:** Add a webhook handler — on payment success, update `organization.plan_id` to a higher tier plan.
 - **Tiered Endpoints:** Assign different "credit costs" per endpoint (heavy = 5 credits, light = 1 credit) by wrapping `check_usage_limits`.
-- **Redis at Scale:** For millions of RPM, replace the PostgreSQL counter with a Redis `INCR` and async-sync to Postgres for permanent records — the interface stays identical.
+- **High-Scale Caching:** For millions of RPM, implement **Redis with Lua scripting** for atomic counters, using a **Write-Behind** pattern to async-flush limits to PostgreSQL for durability.
 
 ---
 
