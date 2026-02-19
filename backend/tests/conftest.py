@@ -44,6 +44,11 @@ def _sync_seed_database() -> None:
 _sync_seed_database()
 
 
+@pytest.fixture(scope="session")
+def anyio_backend():
+    return "asyncio"
+
+
 @pytest.fixture(scope="function")
 async def client() -> AsyncGenerator:
     """
