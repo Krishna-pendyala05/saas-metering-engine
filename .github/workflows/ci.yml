@@ -50,7 +50,7 @@ jobs:
 
       - name: Run database migrations
         run: |
-          alembic upgrade head
+          PYTHONPATH=./backend alembic upgrade head
 
       - name: Run Tests
         working-directory: ./backend
