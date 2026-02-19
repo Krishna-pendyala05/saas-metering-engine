@@ -58,13 +58,18 @@ async def create_user(
     result_plan = await db.execute(select(all_models.SubscriptionPlan).where(all_models.SubscriptionPlan.name == "Free"))
     free_plan = result_plan.scalars().first()
     
-    if free_plan:
-        new_sub = all_models.Subscription(
-            organization_id=new_org.id,
-            plan_id=free_plan.id,
-            is_active=True
+    if not free_plan:
+        raise HTTPException(
+            status_code=500,
+            detail="Server misconfiguration: 'Free' subscription plan not found. Seed the database."
         )
-        db.add(new_sub)
+
+    new_sub = all_models.Subscription(
+        organization_id=new_org.id,
+        plan_id=free_plan.id,
+        is_active=True
+    )
+    db.add(new_sub)
     
     await db.commit()
     await db.refresh(new_user)
